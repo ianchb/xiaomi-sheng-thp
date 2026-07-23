@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
@@ -43,12 +44,14 @@ constexpr int kMaxX = 30479;
 constexpr int kMaxY = 20319;
 constexpr int kPenMaxX = 30479;
 constexpr int kPenMaxY = 20319;
-constexpr int kPenPressureMax = 8191;
 constexpr size_t kStartupReferenceFrames = 72;
 constexpr auto kStreamStallTimeout = std::chrono::milliseconds(100);
 constexpr std::string_view kFocusPenName = "Xiaomi Focus Pen";
 constexpr std::string_view kFocusPenKeyboardName =
     "Xiaomi Focus Pen Keyboard";
+constexpr std::string_view kFocusPenProName = "Xiaomi Focus Pen Pro";
+constexpr std::string_view kFocusPenProKeyboardName =
+    "Xiaomi Focus Pen Pro Keyboard";
 
 std::atomic<bool> running = true;
 
@@ -248,7 +251,7 @@ struct PenButtons {
 };
 
 bool updatePenButtons(PenButtons &buttons, const input_event &event) {
-    if (event.type != EV_KEY)
+    if (event.type != EV_KEY || (event.value != 0 && event.value != 1))
         return false;
     bool *button = nullptr;
     if (event.code == KEY_PAGEDOWN)
@@ -257,7 +260,7 @@ bool updatePenButtons(PenButtons &buttons, const input_event &event) {
         button = &buttons.button2;
     if (!button)
         return false;
-    const bool pressed = event.value != 0;
+    const bool pressed = event.value == 1;
     if (*button == pressed)
         return false;
     *button = pressed;
@@ -266,7 +269,7 @@ bool updatePenButtons(PenButtons &buttons, const input_event &event) {
 
 class UInputPen {
 public:
-    UInputPen() {
+    explicit UInputPen(int maximum_pressure) {
         fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd_ < 0)
             throw std::runtime_error(std::string("open /dev/uinput: ") +
@@ -292,7 +295,7 @@ public:
             throw std::runtime_error("UI_DEV_SETUP failed");
         setupAxis(fd_, ABS_X, 0, kPenMaxX, 113);
         setupAxis(fd_, ABS_Y, 0, kPenMaxY, 113);
-        setupAxis(fd_, ABS_PRESSURE, 0, kPenPressureMax);
+        setupAxis(fd_, ABS_PRESSURE, 0, maximum_pressure);
         setupAxis(fd_, ABS_DISTANCE, 0, 1);
         setupAxis(fd_, ABS_TILT_X, -60, 60);
         setupAxis(fd_, ABS_TILT_Y, -60, 60);
@@ -368,6 +371,81 @@ private:
 
 };
 
+struct ProGestureEvent {
+    unsigned code;
+    bool pressed;
+};
+
+class UInputProGestures {
+public:
+    UInputProGestures() {
+        fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd_ < 0)
+            throw std::runtime_error(std::string("open /dev/uinput: ") +
+                                     std::strerror(errno));
+        checkedIoctl(UI_SET_EVBIT, EV_KEY);
+        checkedIoctl(UI_SET_KEYBIT, KEY_PROG3);
+        checkedIoctl(UI_SET_KEYBIT, KEY_PROG4);
+
+        uinput_setup setup{};
+        setup.id.bustype = BUS_VIRTUAL;
+        setup.id.vendor = 0x2717;
+        setup.id.product = 0x3655;
+        setup.id.version = 1;
+        std::strncpy(setup.name, "Xiaomi Focus Pen Gestures",
+                     sizeof(setup.name) - 1);
+        if (ioctl(fd_, UI_DEV_SETUP, &setup) < 0)
+            throw std::runtime_error("UI_DEV_SETUP failed");
+        if (ioctl(fd_, UI_DEV_CREATE) < 0)
+            throw std::runtime_error("UI_DEV_CREATE failed");
+        usleep(100000);
+    }
+
+    ~UInputProGestures() {
+        if (fd_ < 0)
+            return;
+        try {
+            release();
+        } catch (...) {
+        }
+        ioctl(fd_, UI_DEV_DESTROY);
+        close(fd_);
+    }
+
+    void report(const ProGestureEvent &gesture) {
+        if (gesture.code != KEY_PROG3 && gesture.code != KEY_PROG4)
+            return;
+        std::array<input_event, 2> events{};
+        events[0].type = EV_KEY;
+        events[0].code = static_cast<uint16_t>(gesture.code);
+        events[0].value = gesture.pressed;
+        events[1].type = EV_SYN;
+        events[1].code = SYN_REPORT;
+        writeInputEvents(fd_, events.data(), events.size());
+    }
+
+    void release() {
+        std::array<input_event, 3> events{};
+        events[0].type = EV_KEY;
+        events[0].code = KEY_PROG3;
+        events[0].value = 0;
+        events[1].type = EV_KEY;
+        events[1].code = KEY_PROG4;
+        events[1].value = 0;
+        events[2].type = EV_SYN;
+        events[2].code = SYN_REPORT;
+        writeInputEvents(fd_, events.data(), events.size());
+    }
+
+private:
+    int fd_ = -1;
+
+    void checkedIoctl(unsigned long request, unsigned long value) {
+        if (ioctl(fd_, request, value) < 0)
+            throw std::runtime_error("uinput capability ioctl failed");
+    }
+};
+
 std::string readFirstLine(const std::filesystem::path &path) {
     std::ifstream input(path);
     std::string line;
@@ -375,16 +453,131 @@ std::string readFirstLine(const std::filesystem::path &path) {
     return line;
 }
 
-bool ueventHasName(const std::filesystem::path &path,
-                   std::string_view expected_name) {
-    std::ifstream input(path);
-    std::string line;
-    const std::string expected = "HID_NAME=" + std::string(expected_name);
-    while (std::getline(input, line)) {
-        if (line == expected)
-            return true;
+unsigned readHex(const std::filesystem::path &path) {
+    const std::string value = readFirstLine(path);
+    if (value.empty())
+        return 0;
+    try {
+        return static_cast<unsigned>(std::stoul(value, nullptr, 16));
+    } catch (const std::exception &) {
+        return 0;
     }
-    return false;
+}
+
+unsigned parseHidBus(std::string_view value) {
+    const std::size_t separator = value.find(':');
+    if (separator == std::string_view::npos)
+        return 0;
+    try {
+        return static_cast<unsigned>(std::stoul(
+            std::string(value.substr(0, separator)), nullptr, 16));
+    } catch (const std::exception &) {
+        return 0;
+    }
+}
+
+enum class FocusPenModel {
+    None,
+    Standard,
+    Pro,
+};
+
+struct FocusPenIdentity {
+    std::string name;
+    std::string uniq;
+    std::string phys;
+    unsigned bustype = 0;
+};
+
+FocusPenModel focusPenModelForName(std::string_view name) {
+    if (name == kFocusPenName)
+        return FocusPenModel::Standard;
+    if (name == kFocusPenProName)
+        return FocusPenModel::Pro;
+    return FocusPenModel::None;
+}
+
+FocusPenModel focusPenModelForKeyboard(std::string_view name) {
+    if (name == kFocusPenKeyboardName)
+        return FocusPenModel::Standard;
+    if (name == kFocusPenProKeyboardName)
+        return FocusPenModel::Pro;
+    return FocusPenModel::None;
+}
+
+bool isPhysicalFocusPen(const FocusPenIdentity &identity) {
+    return identity.bustype == BUS_BLUETOOTH && !identity.uniq.empty() &&
+           !identity.phys.empty();
+}
+
+bool sameFocusPen(const FocusPenIdentity &left,
+                  const FocusPenIdentity &right) {
+    return isPhysicalFocusPen(left) && isPhysicalFocusPen(right) &&
+           left.bustype == right.bustype && left.uniq == right.uniq &&
+           left.phys == right.phys;
+}
+
+FocusPenIdentity readEvdevIdentity(
+    const std::filesystem::path &entry) {
+    FocusPenIdentity identity;
+    identity.name = readFirstLine(entry / "device/name");
+    identity.uniq = readFirstLine(entry / "device/uniq");
+    identity.phys = readFirstLine(entry / "device/phys");
+    identity.bustype = readHex(entry / "device/id/bustype");
+    return identity;
+}
+
+struct HidrawCandidate {
+    FocusPenIdentity identity;
+    FocusPenModel model = FocusPenModel::None;
+};
+
+std::optional<HidrawCandidate> readHidrawCandidate(
+    const std::filesystem::path &entry) {
+    std::ifstream input(entry / "device/uevent");
+    if (!input)
+        return std::nullopt;
+    FocusPenIdentity identity;
+    std::string line;
+    while (std::getline(input, line)) {
+        constexpr std::string_view kId = "HID_ID=";
+        constexpr std::string_view kName = "HID_NAME=";
+        constexpr std::string_view kPhys = "HID_PHYS=";
+        constexpr std::string_view kUniq = "HID_UNIQ=";
+        if (line.starts_with(kId))
+            identity.bustype = parseHidBus(line.substr(kId.size()));
+        else if (line.starts_with(kName))
+            identity.name = line.substr(kName.size());
+        else if (line.starts_with(kPhys))
+            identity.phys = line.substr(kPhys.size());
+        else if (line.starts_with(kUniq))
+            identity.uniq = line.substr(kUniq.size());
+    }
+    const FocusPenModel model = focusPenModelForName(identity.name);
+    if (model == FocusPenModel::None || !isPhysicalFocusPen(identity))
+        return std::nullopt;
+    return HidrawCandidate{std::move(identity), model};
+}
+
+std::vector<std::filesystem::path> inputEntries() {
+    std::error_code error;
+    std::vector<std::filesystem::path> entries;
+    for (const auto &entry : std::filesystem::directory_iterator(
+             "/sys/class/input", error)) {
+        if (entry.path().filename().string().starts_with("event"))
+            entries.push_back(entry.path());
+    }
+    std::sort(entries.begin(), entries.end());
+    return entries;
+}
+
+constexpr std::size_t kBitsPerLong = sizeof(unsigned long) * 8;
+constexpr std::size_t kKeyBitWords = KEY_MAX / kBitsPerLong + 1;
+
+bool keyBitIsSet(const std::array<unsigned long, kKeyBitWords> &bits,
+                 unsigned code) {
+    return (bits[code / kBitsPerLong] &
+            (1UL << (code % kBitsPerLong))) != 0;
 }
 
 class FocusPenHidReader {
@@ -395,20 +588,25 @@ public:
         closeButtonEvent();
     }
 
-    std::optional<PenButtons> service(nvt::FocusPenPressureQueue &queue) {
+    void service(nvt::FocusPenPressureQueue &queue) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_scan_) {
             next_scan_ = now + std::chrono::seconds(1);
             if (hidraw_fd_ < 0)
                 openHidraw();
             if (pressure_event_fd_ < 0)
-                grabReportEvent();
+                openPressureEvent();
             if (button_event_fd_ < 0)
-                grabButtonEvent();
+                openButtonEvent();
         }
+        queue.setMaximumPressure(maximumPressure());
         drainHidraw(queue);
         drainPressureEvent();
         drainButtonEvent();
+        queue.setMaximumPressure(maximumPressure());
+    }
+
+    std::optional<PenButtons> takeButtons() {
         if (!button_update_pending_)
             return std::nullopt;
         button_update_pending_ = false;
@@ -419,12 +617,59 @@ public:
         return button_event_fd_;
     }
 
+    int maximumPressure() const {
+        return model_ == FocusPenModel::Pro
+                   ? nvt::FocusPenPressureQueue::kProMaximumPressure
+                   : nvt::FocusPenPressureQueue::kStandardMaximumPressure;
+    }
+
+    std::optional<FocusPenModel> takeModelChange() {
+        return std::exchange(model_change_, std::nullopt);
+    }
+
+    std::optional<ProGestureEvent> takeGesture() {
+        if (gesture_updates_.empty())
+            return std::nullopt;
+        ProGestureEvent gesture = gesture_updates_.front();
+        gesture_updates_.pop_front();
+        return gesture;
+    }
+
+    bool hasActiveInput() const {
+        return buttons_.button1 || buttons_.button2 || slide_up_pressed_ ||
+               slide_down_pressed_;
+    }
+
+    void releaseInputState() {
+        if (buttons_.button1 || buttons_.button2) {
+            buttons_ = {};
+            button_update_pending_ = true;
+        }
+        if (slide_up_pressed_) {
+            slide_up_pressed_ = false;
+            gesture_updates_.push_back(ProGestureEvent{KEY_PROG3, false});
+        }
+        if (slide_down_pressed_) {
+            slide_down_pressed_ = false;
+            gesture_updates_.push_back(ProGestureEvent{KEY_PROG4, false});
+        }
+        button_resync_pending_ = false;
+    }
+
 private:
     int hidraw_fd_ = -1;
     int pressure_event_fd_ = -1;
     int button_event_fd_ = -1;
+    FocusPenModel model_ = FocusPenModel::None;
+    std::optional<FocusPenModel> model_change_;
+    FocusPenIdentity identity_;
+    bool have_identity_ = false;
     PenButtons buttons_{};
     bool button_update_pending_ = false;
+    bool slide_up_pressed_ = false;
+    bool slide_down_pressed_ = false;
+    bool button_resync_pending_ = false;
+    std::deque<ProGestureEvent> gesture_updates_;
     std::chrono::steady_clock::time_point next_scan_{};
 
     void openHidraw() {
@@ -435,30 +680,35 @@ private:
             entries.push_back(entry.path());
         std::sort(entries.begin(), entries.end());
         for (const auto &entry : entries) {
-            if (!ueventHasName(entry / "device/uevent", kFocusPenName))
+            const auto candidate = readHidrawCandidate(entry);
+            if (!candidate || !matchesIdentity(candidate->identity) ||
+                (model_ != FocusPenModel::None &&
+                 model_ != candidate->model))
                 continue;
             const std::string path = "/dev/" + entry.filename().string();
             const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
             if (fd < 0)
                 continue;
             hidraw_fd_ = fd;
+            adoptIdentity(candidate->identity);
+            setModel(candidate->model);
             std::cerr << "pen pressure transport ready (" << path
-                      << ", HID report 5)\n";
+                      << ", HID report 5, pressure 0.."
+                      << maximumPressure() << ")\n";
             return;
         }
     }
 
-    void grabReportEvent() {
-        std::error_code error;
-        std::vector<std::filesystem::path> entries;
-        for (const auto &entry : std::filesystem::directory_iterator(
-                 "/sys/class/input", error)) {
-            if (entry.path().filename().string().starts_with("event"))
-                entries.push_back(entry.path());
-        }
-        std::sort(entries.begin(), entries.end());
-        for (const auto &entry : entries) {
-            if (readFirstLine(entry / "device/name") != kFocusPenName)
+    void openPressureEvent() {
+        for (const auto &entry : inputEntries()) {
+            const FocusPenIdentity candidate = readEvdevIdentity(entry);
+            const FocusPenModel candidate_model =
+                focusPenModelForName(candidate.name);
+            if (candidate_model == FocusPenModel::None ||
+                !isPhysicalFocusPen(candidate) ||
+                !matchesIdentity(candidate) ||
+                (model_ != FocusPenModel::None &&
+                 model_ != candidate_model))
                 continue;
             const std::string path = "/dev/input/" + entry.filename().string();
             const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -469,24 +719,24 @@ private:
                 continue;
             }
             pressure_event_fd_ = fd;
-            std::cerr << "claimed Focus Pen report-5 evdev transport ("
-                      << path << "); keypad-plus events suppressed\n";
+            adoptIdentity(candidate);
+            setModel(candidate_model);
+            std::cerr << "claimed physical Focus Pen pressure transport ("
+                      << path << "); report-5 key events suppressed\n";
             return;
         }
     }
 
-    void grabButtonEvent() {
-        std::error_code error;
-        std::vector<std::filesystem::path> entries;
-        for (const auto &entry : std::filesystem::directory_iterator(
-                 "/sys/class/input", error)) {
-            if (entry.path().filename().string().starts_with("event"))
-                entries.push_back(entry.path());
-        }
-        std::sort(entries.begin(), entries.end());
-        for (const auto &entry : entries) {
-            if (readFirstLine(entry / "device/name") !=
-                kFocusPenKeyboardName)
+    void openButtonEvent() {
+        for (const auto &entry : inputEntries()) {
+            const FocusPenIdentity candidate = readEvdevIdentity(entry);
+            const FocusPenModel candidate_model =
+                focusPenModelForKeyboard(candidate.name);
+            if (candidate_model == FocusPenModel::None ||
+                !isPhysicalFocusPen(candidate) ||
+                !matchesIdentity(candidate) ||
+                (model_ != FocusPenModel::None &&
+                 model_ != candidate_model))
                 continue;
             const std::string path = "/dev/input/" + entry.filename().string();
             const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -497,8 +747,10 @@ private:
                 continue;
             }
             button_event_fd_ = fd;
-            std::cerr << "claimed Focus Pen button evdev transport ("
-                      << path << "); PageDown/PageUp mapped to stylus buttons\n";
+            adoptIdentity(candidate);
+            setModel(candidate_model);
+            std::cerr << "claimed physical Focus Pen button transport ("
+                      << path << ")\n";
             return;
         }
     }
@@ -516,7 +768,7 @@ private:
             }
             if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return;
-            closeHidraw();
+            disconnect();
             return;
         }
     }
@@ -532,7 +784,7 @@ private:
                 continue;
             if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return;
-            closePressureEvent();
+            disconnect();
             return;
         }
     }
@@ -546,20 +798,101 @@ private:
                 button_event_fd_, events.data(), sizeof(events));
             if (size > 0) {
                 if (size % static_cast<ssize_t>(sizeof(input_event)) != 0) {
-                    closeButtonEvent();
+                    disconnect();
                     return;
                 }
                 const size_t count = static_cast<size_t>(size) / sizeof(input_event);
-                for (size_t index = 0; index < count; ++index) {
-                    if (updatePenButtons(buttons_, events[index]))
-                        button_update_pending_ = true;
-                }
+                for (size_t index = 0; index < count; ++index)
+                    consumeButtonEvent(events[index]);
                 continue;
             }
             if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return;
-            closeButtonEvent();
+            disconnect();
             return;
+        }
+    }
+
+    void consumeButtonEvent(const input_event &event) {
+        if (button_resync_pending_) {
+            if (event.type == EV_SYN && event.code == SYN_REPORT) {
+                button_resync_pending_ = false;
+                synchronizeButtonState();
+            }
+            return;
+        }
+        if (event.type == EV_SYN && event.code == SYN_DROPPED) {
+            releaseInputState();
+            button_resync_pending_ = true;
+            std::cerr << "Focus Pen button event queue overflow; "
+                         "resync pending\n";
+            return;
+        }
+        if (model_ == FocusPenModel::Standard) {
+            if (updatePenButtons(buttons_, event))
+                button_update_pending_ = true;
+            return;
+        }
+        if (model_ != FocusPenModel::Pro || event.type != EV_KEY ||
+            (event.value != 0 && event.value != 1))
+            return;
+
+        bool *button = nullptr;
+        if (event.code == KEY_F19)
+            button = &buttons_.button1;
+        else if (event.code == KEY_KPENTER)
+            button = &buttons_.button2;
+        if (button) {
+            const bool pressed = event.value == 1;
+            if (*button == pressed)
+                return;
+            *button = pressed;
+            button_update_pending_ = true;
+            return;
+        }
+
+        bool *slide = nullptr;
+        unsigned output_code = 0;
+        if (event.code == KEY_KP9) {
+            slide = &slide_up_pressed_;
+            output_code = KEY_PROG3;
+        } else if (event.code == KEY_KP3) {
+            slide = &slide_down_pressed_;
+            output_code = KEY_PROG4;
+        }
+        if (!slide)
+            return;
+        const bool pressed = event.value == 1;
+        if (*slide == pressed)
+            return;
+        *slide = pressed;
+        gesture_updates_.push_back(ProGestureEvent{output_code, pressed});
+    }
+
+    void synchronizeButtonState() {
+        if (button_event_fd_ < 0)
+            return;
+        std::array<unsigned long, kKeyBitWords> bits{};
+        if (ioctl(button_event_fd_, EVIOCGKEY(sizeof(bits)), bits.data()) < 0) {
+            std::cerr << "Focus Pen button state resync failed: "
+                      << std::strerror(errno) << '\n';
+            return;
+        }
+        const auto replay = [&](unsigned code) {
+            input_event event{};
+            event.type = EV_KEY;
+            event.code = static_cast<uint16_t>(code);
+            event.value = keyBitIsSet(bits, code) ? 1 : 0;
+            consumeButtonEvent(event);
+        };
+        if (model_ == FocusPenModel::Standard) {
+            replay(KEY_PAGEDOWN);
+            replay(KEY_PAGEUP);
+        } else if (model_ == FocusPenModel::Pro) {
+            replay(KEY_F19);
+            replay(KEY_KPENTER);
+            replay(KEY_KP9);
+            replay(KEY_KP3);
         }
     }
 
@@ -583,10 +916,51 @@ private:
             close(button_event_fd_);
         }
         button_event_fd_ = -1;
-        if (buttons_.button1 || buttons_.button2) {
-            buttons_ = {};
-            button_update_pending_ = true;
-        }
+        button_resync_pending_ = false;
+    }
+
+    void disconnect() {
+        const bool was_connected = model_ != FocusPenModel::None ||
+                                   hidraw_fd_ >= 0 ||
+                                   pressure_event_fd_ >= 0 ||
+                                   button_event_fd_ >= 0;
+        releaseInputState();
+        closeHidraw();
+        closePressureEvent();
+        closeButtonEvent();
+        setModel(FocusPenModel::None);
+        identity_ = {};
+        have_identity_ = false;
+        if (was_connected)
+            std::cerr << "Focus Pen physical transport disconnected; "
+                         "inputs released\n";
+    }
+
+    void setModel(FocusPenModel model) {
+        if (model_ == model)
+            return;
+        releaseInputState();
+        model_ = model;
+        model_change_ = model_;
+        if (model_ == FocusPenModel::Standard)
+            std::cerr << "Focus Pen model: standard\n";
+        else if (model_ == FocusPenModel::Pro)
+            std::cerr << "Focus Pen model: pro\n";
+    }
+
+    bool matchesIdentity(const FocusPenIdentity &candidate) const {
+        if (!isPhysicalFocusPen(candidate))
+            return false;
+        if (!have_identity_)
+            return true;
+        return sameFocusPen(identity_, candidate);
+    }
+
+    void adoptIdentity(const FocusPenIdentity &candidate) {
+        if (have_identity_)
+            return;
+        identity_ = candidate;
+        have_identity_ = true;
     }
 };
 
@@ -760,12 +1134,12 @@ int main() try {
                                  std::strerror(errno));
     std::optional<UInputTouch> touch;
     std::optional<UInputPen> pen;
+    std::optional<UInputProGestures> gestures;
     try {
         writeControl(kStylusPath, 1);
         writeControl(kControlPath, 1);
         touch.emplace();
-        pen.emplace();
-        std::cerr << "touch and pen pipelines ready\n";
+        std::cerr << "touch pipeline ready\n";
         std::cerr << "waiting for a touch reference frame\n";
         LiveTouchAdapter adapter;
         nvt::StylusDecoder pen_decoder;
@@ -778,24 +1152,75 @@ int main() try {
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
         StreamReader reader(stream_fd);
+        auto applyPenTransportOutputs = [&]() {
+            const auto model_change = pen_transport.takeModelChange();
+            if (model_change) {
+                if (pen) {
+                    pen->reportButtons({});
+                    pen->report({});
+                }
+                if (gestures)
+                    gestures->release();
+                pen_active = false;
+                pen_pressure.reset();
+                gestures.reset();
+                pen.reset();
+                if (*model_change != FocusPenModel::None) {
+                    const int maximum_pressure =
+                        *model_change == FocusPenModel::Pro
+                            ? nvt::FocusPenPressureQueue::kProMaximumPressure
+                            : nvt::FocusPenPressureQueue::kStandardMaximumPressure;
+                    pen.emplace(maximum_pressure);
+                    std::cerr << "Focus Pen output ready (pressure 0.."
+                              << maximum_pressure << ")\n";
+                }
+                if (*model_change == FocusPenModel::Pro) {
+                    try {
+                        gestures.emplace();
+                        std::cerr << "Focus Pen Pro slide output ready\n";
+                    } catch (const std::exception &error) {
+                        std::cerr << "Focus Pen Pro slide output disabled: "
+                                  << error.what() << '\n';
+                    }
+                }
+            }
+            if (const auto buttons = pen_transport.takeButtons();
+                buttons && pen)
+                pen->reportButtons(*buttons);
+            while (const auto gesture = pen_transport.takeGesture()) {
+                if (!gestures)
+                    continue;
+                try {
+                    gestures->report(*gesture);
+                } catch (const std::exception &error) {
+                    std::cerr << "Focus Pen Pro slide output failed: "
+                              << error.what() << '\n';
+                    gestures.reset();
+                }
+            }
+        };
+        auto servicePenTransport = [&]() {
+            pen_transport.service(pen_pressure);
+            applyPenTransportOutputs();
+        };
+        auto releasePenInputs = [&]() {
+            pen_transport.releaseInputState();
+            applyPenTransportOutputs();
+            pen_pressure.reset();
+            if (pen)
+                pen->report({});
+            pen_active = false;
+        };
         auto resetPipelines = [&]() {
             if (touch)
                 touch->report({});
-            if (pen)
-                pen->report({});
+            releasePenInputs();
             adapter.reset();
             pen_decoder.reset();
             stylus_mutual = {};
-            pen_pressure = {};
             touch_active = false;
-            pen_active = false;
             have_valid_frame = false;
             stream_stalled = false;
-        };
-        auto servicePenTransport = [&]() {
-            const auto buttons = pen_transport.service(pen_pressure);
-            if (buttons && pen)
-                pen->reportButtons(*buttons);
         };
         while (running) {
             servicePenTransport();
@@ -904,26 +1329,29 @@ int main() try {
                         touch->report(update.result->slots);
                 });
             }
-            if (have_valid_frame && (touch_active || pen_active) &&
+            if (have_valid_frame &&
+                (touch_active || pen_active ||
+                 pen_transport.hasActiveInput()) &&
                 !stream_stalled &&
                 std::chrono::steady_clock::now() - last_valid_frame >=
                     kStreamStallTimeout) {
                 if (touch)
                     touch->report({});
-                if (pen)
-                    pen->report({});
+                releasePenInputs();
                 touch_active = false;
-                pen_active = false;
                 stream_stalled = true;
                 std::cerr << "THP stream stalled; released active inputs\n";
             }
         }
+        releasePenInputs();
+        gestures.reset();
     } catch (...) {
         try { writeControl(kStylusPath, 0); } catch (...) {}
         try { writeControl(kControlPath, 0); } catch (...) {}
         close(stream_fd);
         throw;
     }
+    gestures.reset();
     pen.reset();
     touch.reset();
     writeControl(kStylusPath, 0);
