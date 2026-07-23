@@ -6,7 +6,8 @@ reads raw THP frames from the kernel and creates standard Linux input devices
 through uinput.
 
 Finger input, multi-touch tracking, palm rejection, pen coordinates, tilt,
-hover, and Bluetooth HID pressure are supported. Please note that pen scanning
+hover, and Bluetooth HID pressure are supported for both the Xiaomi Focus Pen
+and Focus Pen Pro. Please note that pen scanning
 is only available when the panel is running at 60 Hz or 120 Hz.
 
 ## Requirements
@@ -35,6 +36,13 @@ transport, and creates uinput devices.
 
 ```sh
 make -j"$(nproc)"
+```
+
+The default build enables Focus Pen Pro haptics and links against libsystemd.
+To build without haptics:
+
+```sh
+make HAPTICS=0 -j"$(nproc)"
 ```
 
 The executable is written to `build/xiaomi-sheng-thp`.

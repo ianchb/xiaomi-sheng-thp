@@ -24,7 +24,7 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: bluez, libc6, libstdc++6, systemd
+Depends: bluez, libc6, libstdc++6, libsystemd0, systemd
 Recommends: xiaomi-pen-status
 Maintainer: siergtc <i@4t.pw>
 Description: NT36532E userspace touch processor for Xiaomi Sheng

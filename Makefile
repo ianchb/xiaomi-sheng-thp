@@ -3,7 +3,7 @@ CPPFLAGS += -Isrc
 CXXFLAGS ?= -O3 -flto -std=c++20
 CXXFLAGS += -Wall -Wextra -Werror
 
-HAPTICS ?= 0
+HAPTICS ?= 1
 ifeq ($(HAPTICS),1)
 HAPTICS_SOURCE := src/bluez_pen_haptics.cpp
 CXXFLAGS += -pthread
