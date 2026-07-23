@@ -3,14 +3,26 @@ CPPFLAGS += -Isrc
 CXXFLAGS ?= -O3 -flto -std=c++20
 CXXFLAGS += -Wall -Wextra -Werror
 
+HAPTICS ?= 0
+ifeq ($(HAPTICS),1)
+HAPTICS_SOURCE := src/bluez_pen_haptics.cpp
+CXXFLAGS += -pthread
+LDLIBS += -lsystemd -pthread
+else
+HAPTICS_SOURCE := src/focus_pen_haptics_stub.cpp
+endif
+
 BUILD := build
 TARGET := $(BUILD)/xiaomi-sheng-thp
+HAPTICS_STAMP := $(BUILD)/.haptics-$(HAPTICS)
 SOURCES := \
+	$(HAPTICS_SOURCE) \
 	src/nvt_touch_core.cpp \
 	src/nvt_finger_filter.cpp \
 	src/nvt_stylus.cpp \
 	src/xiaomi_sheng_thp.cpp
 HEADERS := \
+	src/focus_pen_haptics.hpp \
 	src/nvt_touch_core.hpp \
 	src/nvt_finger_filter.hpp \
 	src/nvt_stylus.hpp \
@@ -28,8 +40,12 @@ all: $(TARGET)
 $(BUILD):
 	mkdir -p $@
 
-$(TARGET): $(SOURCES) $(HEADERS) | $(BUILD)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SOURCES) -o $@
+$(HAPTICS_STAMP): | $(BUILD)
+	rm -f $(BUILD)/.haptics-0 $(BUILD)/.haptics-1
+	touch $@
+
+$(TARGET): $(SOURCES) $(HEADERS) $(HAPTICS_STAMP) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(SOURCES) $(LDLIBS) -o $@
 
 install: $(TARGET)
 	install -Dm755 -s $(TARGET) \

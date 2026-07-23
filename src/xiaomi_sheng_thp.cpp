@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#include "focus_pen_haptics.hpp"
 #include "nvt_touch_core.hpp"
 #include "nvt_finger_filter.hpp"
 #include "nvt_stylus.hpp"
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <memory>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
@@ -635,6 +637,24 @@ public:
         return gesture;
     }
 
+    bool takeDoublePressHaptic() {
+        if (double_press_haptics_ == 0)
+            return false;
+        --double_press_haptics_;
+        return true;
+    }
+
+    bool takeSlideHaptic() {
+        if (slide_haptics_ == 0)
+            return false;
+        --slide_haptics_;
+        return true;
+    }
+
+    std::string_view deviceAddress() const {
+        return device_address_;
+    }
+
     bool hasActiveInput() const {
         return buttons_.button1 || buttons_.button2 || slide_up_pressed_ ||
                slide_down_pressed_;
@@ -653,6 +673,8 @@ public:
             slide_down_pressed_ = false;
             gesture_updates_.push_back(ProGestureEvent{KEY_PROG4, false});
         }
+        double_press_haptics_ = 0;
+        slide_haptics_ = 0;
         button_resync_pending_ = false;
     }
 
@@ -664,12 +686,15 @@ private:
     std::optional<FocusPenModel> model_change_;
     FocusPenIdentity identity_;
     bool have_identity_ = false;
+    std::string device_address_;
     PenButtons buttons_{};
     bool button_update_pending_ = false;
     bool slide_up_pressed_ = false;
     bool slide_down_pressed_ = false;
     bool button_resync_pending_ = false;
     std::deque<ProGestureEvent> gesture_updates_;
+    unsigned double_press_haptics_ = 0;
+    unsigned slide_haptics_ = 0;
     std::chrono::steady_clock::time_point next_scan_{};
 
     void openHidraw() {
@@ -813,7 +838,8 @@ private:
         }
     }
 
-    void consumeButtonEvent(const input_event &event) {
+    void consumeButtonEvent(const input_event &event,
+                            bool allow_haptics = true) {
         if (button_resync_pending_) {
             if (event.type == EV_SYN && event.code == SYN_REPORT) {
                 button_resync_pending_ = false;
@@ -848,6 +874,8 @@ private:
                 return;
             *button = pressed;
             button_update_pending_ = true;
+            if (allow_haptics && pressed && event.code == KEY_KPENTER)
+                ++double_press_haptics_;
             return;
         }
 
@@ -867,6 +895,8 @@ private:
             return;
         *slide = pressed;
         gesture_updates_.push_back(ProGestureEvent{output_code, pressed});
+        if (allow_haptics && pressed)
+            ++slide_haptics_;
     }
 
     void synchronizeButtonState() {
@@ -883,7 +913,7 @@ private:
             event.type = EV_KEY;
             event.code = static_cast<uint16_t>(code);
             event.value = keyBitIsSet(bits, code) ? 1 : 0;
-            consumeButtonEvent(event);
+            consumeButtonEvent(event, false);
         };
         if (model_ == FocusPenModel::Standard) {
             replay(KEY_PAGEDOWN);
@@ -931,6 +961,7 @@ private:
         setModel(FocusPenModel::None);
         identity_ = {};
         have_identity_ = false;
+        device_address_.clear();
         if (was_connected)
             std::cerr << "Focus Pen physical transport disconnected; "
                          "inputs released\n";
@@ -961,6 +992,7 @@ private:
             return;
         identity_ = candidate;
         have_identity_ = true;
+        device_address_ = candidate.uniq;
     }
 };
 
@@ -1146,6 +1178,8 @@ int main() try {
         nvt::StylusMutualAssembler stylus_mutual;
         nvt::FocusPenPressureQueue pen_pressure;
         FocusPenHidReader pen_transport;
+        const std::unique_ptr<FocusPenHaptics> pen_haptics =
+            makeFocusPenHaptics();
         bool touch_active = false;
         bool pen_active = false;
         bool have_valid_frame = false;
@@ -1163,6 +1197,8 @@ int main() try {
                     gestures->release();
                 pen_active = false;
                 pen_pressure.reset();
+                if (pen_haptics)
+                    pen_haptics->reset();
                 gestures.reset();
                 pen.reset();
                 if (*model_change != FocusPenModel::None) {
@@ -1198,15 +1234,28 @@ int main() try {
                     gestures.reset();
                 }
             }
+            while (pen_transport.takeDoublePressHaptic()) {
+                if (pen_haptics)
+                    pen_haptics->scheduleDoublePress();
+            }
+            while (pen_transport.takeSlideHaptic()) {
+                if (pen_haptics)
+                    pen_haptics->triggerSlide();
+            }
         };
         auto servicePenTransport = [&]() {
             pen_transport.service(pen_pressure);
+            if (pen_haptics)
+                pen_haptics->setDeviceAddress(
+                    pen_transport.deviceAddress());
             applyPenTransportOutputs();
         };
         auto releasePenInputs = [&]() {
             pen_transport.releaseInputState();
             applyPenTransportOutputs();
             pen_pressure.reset();
+            if (pen_haptics)
+                pen_haptics->reset();
             if (pen)
                 pen->report({});
             pen_active = false;
